@@ -1,0 +1,230 @@
+# 1) Imports & config
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_curve, roc_auc_score, auc, precision_score, recall_score, f1_score
+from imblearn.over_sampling import SMOTE
+import joblib
+
+# For autoencoder
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+RND = 42
+np.random.seed(RND)
+tf.random.set_seed(RND)
+
+
+# 2) Load data
+DATA_PATH = "creditcard.csv"  # change if needed
+if not os.path.exists(DATA_PATH):
+    raise FileNotFoundError(f"{DATA_PATH} not found. Place creditcard.csv here.")
+df = pd.read_csv(DATA_PATH)
+print("Shape:", df.shape)
+print(df.head())
+
+
+# 3) Quick EDA (plots)
+# Class distribution
+plt.figure(figsize=(5,4))
+sns.countplot(x='Class', data=df)
+plt.title('Class distribution (0 = legit, 1 = fraud)')
+plt.show()
+
+# Amount distribution (log-scale for better view)
+plt.figure(figsize=(12,5))
+plt.subplot(1,2,1)
+sns.histplot(df[df['Class']==0]['Amount'], bins=50, log_scale=(True, False))
+plt.title('Amount - Non-Fraud (log x)')
+plt.subplot(1,2,2)
+sns.histplot(df[df['Class']==1]['Amount'], bins=50, log_scale=(True, False))
+plt.title('Amount - Fraud (log x)')
+plt.tight_layout()
+plt.show()
+
+# Houral approximation from Time
+df['Hour'] = ((df['Time'] % (24*3600)) // 3600).astype(int)
+plt.figure(figsize=(12,4))
+sns.countplot(x='Hour', hue='Class', data=df)
+plt.title('Transactions by approximate hour')
+plt.xticks(rotation=90)
+plt.show()
+
+# Correlation heatmap (be careful: large)
+plt.figure(figsize=(10,8))
+sns.heatmap(df.corr(), cmap='coolwarm', center=0, vmax=0.6)
+plt.title('Correlation matrix')
+plt.show()
+
+
+# 4) Preprocessing: features, scaling, train-test split
+FEATURES = [c for c in df.columns if c not in ['Class']]
+X = df[FEATURES].copy()
+y = df['Class'].copy()
+
+# Scale Amount and Time (V1..V28 are already PCA-like)
+scaler = StandardScaler()
+X[['Amount', 'Time']] = scaler.fit_transform(X[['Amount','Time']])
+# Save scaler for deployment
+joblib.dump(scaler, 'scaler.joblib')
+
+# Train-test split (stratified)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=RND)
+print("Train:", X_train.shape, "Test:", X_test.shape)
+print("Train class counts:\n", y_train.value_counts())
+
+
+# 5) Handle imbalance: apply SMOTE on training set
+print("Before SMOTE:", y_train.value_counts().to_dict())
+sm = SMOTE(random_state=RND)
+X_train_sm, y_train_sm = sm.fit_resample(X_train, y_train)
+print("After SMOTE:", y_train_sm.value_counts().to_dict())
+
+
+# 6) Baseline: Logistic Regression (trained on SMOTE data)
+lr = LogisticRegression(max_iter=1000, random_state=RND)
+lr.fit(X_train_sm, y_train_sm)
+
+y_proba_lr = lr.predict_proba(X_test)[:,1]
+# default threshold 0.5
+y_pred_lr = (y_proba_lr >= 0.5).astype(int)
+print("Logistic Regression (threshold 0.5)")
+print(classification_report(y_test, y_pred_lr, digits=4))
+print("ROC AUC:", roc_auc_score(y_test, y_proba_lr))
+
+# Find threshold maximizing F1 on test PR curve (for demonstration)
+prec, rec, th = precision_recall_curve(y_test, y_proba_lr)
+f1s = 2*(prec*rec)/(prec+rec+1e-8)
+best_idx = np.nanargmax(f1s)
+best_threshold_lr = th[best_idx] if best_idx < len(th) else 0.5
+print("LR best threshold (approx):", best_threshold_lr)
+
+
+# 7) Random Forest (train on SMOTE)
+rf = RandomForestClassifier(n_estimators=200, n_jobs=-1, random_state=RND)
+rf.fit(X_train_sm, y_train_sm)
+
+y_proba_rf = rf.predict_proba(X_test)[:,1]
+# use LR-found threshold as starting point, later we'll tune RF threshold too
+y_pred_rf = (y_proba_rf >= best_threshold_lr).astype(int)
+print("Random Forest (threshold from LR):")
+print(classification_report(y_test, y_pred_rf, digits=4))
+print("ROC AUC (RF):", roc_auc_score(y_test, y_proba_rf))
+
+# Feature importance
+fi = pd.Series(rf.feature_importances_, index=X.columns).sort_values(ascending=False)
+print("Top 10 features:\n", fi.head(10))
+
+# Save RF model
+joblib.dump(rf, 'random_forest_fraud.joblib')
+
+
+# 8) Isolation Forest (unsupervised anomaly detection)
+# Train on non-fraud examples only (learn 'normal' behavior)
+X_train_nonfraud = X_train[y_train==0]
+iso = IsolationForest(n_estimators=200, contamination=y_train.mean(), random_state=RND)
+iso.fit(X_train_nonfraud)
+
+iso_pred = iso.predict(X_test)  # -1 anomaly, 1 normal
+iso_binary = (iso_pred == -1).astype(int)
+print("Isolation Forest results:")
+print(classification_report(y_test, iso_binary, digits=4))
+
+
+# 9) Autoencoder (train only on non-fraud data)
+X_ae = X_train_nonfraud.values
+input_dim = X_ae.shape[1]
+
+def build_autoencoder(input_dim, encoding_dim=16):
+    inp = keras.Input(shape=(input_dim,))
+    x = layers.Dense(encoding_dim, activation='relu')(inp)
+    x = layers.Dense(max(encoding_dim//2, 4), activation='relu')(x)
+    x = layers.Dense(encoding_dim, activation='relu')(x)
+    out = layers.Dense(input_dim, activation='linear')(x)
+    model = keras.Model(inputs=inp, outputs=out)
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
+ae = build_autoencoder(input_dim, encoding_dim=16)
+ae.summary()
+
+# Train
+history = ae.fit(X_ae, X_ae,
+                 epochs=30,
+                 batch_size=256,
+                 shuffle=True,
+                 validation_data=(X_test[y_test==0].values, X_test[y_test==0].values),
+                 verbose=2)
+
+# Reconstruction error on test set
+X_test_vals = X_test.values
+recon = ae.predict(X_test_vals)
+mse = np.mean(np.power(X_test_vals - recon, 2), axis=1)
+
+# threshold from training non-fraud reconstruction errors
+recon_train = ae.predict(X_ae)
+mse_train = np.mean(np.power(X_ae - recon_train, 2), axis=1)
+thr_ae = np.percentile(mse_train, 99.5)  # conservative threshold
+print("Autoencoder threshold (99.5 percentile):", thr_ae)
+
+ae_preds = (mse > thr_ae).astype(int)
+print("Autoencoder results:")
+print(classification_report(y_test, ae_preds, digits=4))
+
+# Save autoencoder
+ae.save('autoencoder_fraud.h5')
+
+# 10) Summary comparison for core metrics
+results = []
+# Logistic
+p_lr = precision_score(y_test, y_pred_lr, zero_division=0)
+r_lr = recall_score(y_test, y_pred_lr)
+f1_lr = f1_score(y_test, y_pred_lr)
+roc_lr = roc_auc_score(y_test, y_proba_lr)
+results.append(('LogisticRegression', p_lr, r_lr, f1_lr, roc_lr))
+
+# Random Forest (use 0.5 threshold and also tuned threshold below)
+p_rf = precision_score(y_test, y_pred_rf, zero_division=0)
+r_rf = recall_score(y_test, y_pred_rf)
+f1_rf = f1_score(y_test, y_pred_rf)
+roc_rf = roc_auc_score(y_test, y_proba_rf)
+results.append(('RandomForest', p_rf, r_rf, f1_rf, roc_rf))
+
+# Isolation Forest
+p_iso = precision_score(y_test, iso_binary, zero_division=0)
+r_iso = recall_score(y_test, iso_binary)
+f1_iso = f1_score(y_test, iso_binary)
+results.append(('IsolationForest', p_iso, r_iso, f1_iso, np.nan))
+
+# Autoencoder
+p_ae = precision_score(y_test, ae_preds, zero_division=0)
+r_ae = recall_score(y_test, ae_preds)
+f1_ae = f1_score(y_test, ae_preds)
+results.append(('Autoencoder', p_ae, r_ae, f1_ae, np.nan))
+
+res_df = pd.DataFrame(results, columns=['Model','Precision','Recall','F1','ROC_AUC'])
+print(res_df)
+
+
+# 11) Tune RF threshold by PR curve for better F1 (optional)
+prec_rf, rec_rf, thr_rf = precision_recall_curve(y_test, y_proba_rf)
+f1s_rf = 2*(prec_rf*rec_rf)/(prec_rf+rec_rf+1e-8)
+ix_rf = np.nanargmax(f1s_rf)
+best_thr_rf = thr_rf[ix_rf] if ix_rf < len(thr_rf) else 0.5
+print("RF best threshold by PR-F1:", best_thr_rf)
+
+y_pred_rf_best = (y_proba_rf >= best_thr_rf).astype(int)
+print("RF report (best threshold):")
+print(classification_report(y_test, y_pred_rf_best, digits=4))
+
+# Save RF with chosen threshold info for deployment
+joblib.dump({'model_path':'random_forest_fraud.joblib','threshold':float(best_thr_rf)}, 'rf_deploy_info.joblib')
+
+
